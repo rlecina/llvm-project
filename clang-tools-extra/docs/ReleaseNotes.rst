@@ -85,6 +85,12 @@ New modules
 New checks
 ^^^^^^^^^^
 
+- New :doc:`misc-sort-constructor-initializers
+  <clang-tidy/checks/misc-sort-constructor-initializers>` check.
+
+  Checks member initiazer list are sorted. Allows to prepare codebase to use 
+  -Wreorder
+  
 - New :doc:`altera-struct-pack-align
   <clang-tidy/checks/altera-struct-pack-align>` check.
 

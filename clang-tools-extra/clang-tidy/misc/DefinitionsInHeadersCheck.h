@@ -42,9 +42,13 @@ public:
   void check(const ast_matchers::MatchFinder::MatchResult &Result) override;
 
 private:
+  const bool IncludeInternalLinkage;
   const bool UseHeaderFileExtension;
   const std::string RawStringHeaderFileExtensions;
   utils::FileExtensionsSet HeaderFileExtensions;
+
+  template <typename T>
+  void Fix(const T* decl, SourceManager *SourceManager, const LangOptions& LangOpts);
 };
 
 } // namespace misc

@@ -9,6 +9,7 @@
 #include "DefinitionsInHeadersCheck.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/ASTMatchers/ASTMatchFinder.h"
+#include "clang/Lex/Lexer.h"
 
 using namespace clang::ast_matchers;
 
@@ -25,14 +26,36 @@ AST_MATCHER_P(NamedDecl, usesHeaderFileExtension, utils::FileExtensionsSet,
       HeaderFileExtensions);
 }
 
+llvm::Optional<SourceLocation> findStaticKeywordLocation(const DeclaratorDecl* Decl,
+                                                         SourceManager *SM,
+                                                         const LangOptions& LangOpts)
+{
+    llvm::Optional<SourceLocation> loc = Decl->getInnerLocStart();
+    while(loc && loc <= Decl->getEndLoc())
+    {
+        auto Range = CharSourceRange::getTokenRange(*loc);
+        if(Lexer::getSourceText(Range, *SM, LangOpts) == "static")
+        {
+            return loc;
+        }
+        auto Next = Lexer::findNextToken(*loc, *SM, LangOpts);
+        loc = Next.map([](const auto& token) {
+            return token.getLocation();
+            });
+    }
+    return llvm::None;
+}
+
 } // namespace
 
 DefinitionsInHeadersCheck::DefinitionsInHeadersCheck(StringRef Name,
                                                      ClangTidyContext *Context)
     : ClangTidyCheck(Name, Context),
-      UseHeaderFileExtension(Options.get("UseHeaderFileExtension", true)),
+    IncludeInternalLinkage(Options.get("IncludeInternalLinkage", false)),
+    UseHeaderFileExtension(Options.get("UseHeaderFileExtension", true)),
       RawStringHeaderFileExtensions(Options.getLocalOrGlobal(
-          "HeaderFileExtensions", utils::defaultHeaderFileExtensions())) {
+          "HeaderFileExtensions", utils::defaultHeaderFileExtensions()))
+{
   if (!utils::parseFileExtensions(RawStringHeaderFileExtensions,
                                   HeaderFileExtensions,
                                   utils::defaultFileExtensionDelimiters())) {
@@ -47,6 +70,7 @@ void DefinitionsInHeadersCheck::storeOptions(
     ClangTidyOptions::OptionMap &Opts) {
   Options.store(Opts, "UseHeaderFileExtension", UseHeaderFileExtension);
   Options.store(Opts, "HeaderFileExtensions", RawStringHeaderFileExtensions);
+  Options.store(Opts, "IncludeInternalLinkage", IncludeInternalLinkage);
 }
 
 void DefinitionsInHeadersCheck::registerMatchers(MatchFinder *Finder) {
@@ -68,6 +92,32 @@ void DefinitionsInHeadersCheck::registerMatchers(MatchFinder *Finder) {
   }
 }
 
+template <typename T>
+void DefinitionsInHeadersCheck::Fix(const T* decl,  SourceManager *SM, 
+                                    const LangOptions& LangOpts)
+{
+  if(decl->getStorageClass() == SC_Static)
+  {
+    if(auto loc = findStaticKeywordLocation(decl, SM, LangOpts)) {
+      diag(*loc, /*FixDescription=*/"replace 'static' by 'inline'",
+           DiagnosticIDs::Note)
+           << FixItHint::CreateReplacement(*loc, "inline");
+    } else {
+      diag(decl->getInnerLocStart(), "replace 'static' by 'inline'",
+           DiagnosticIDs::Note);
+    }
+  }
+  else
+  {
+    auto TokenCharRange = CharSourceRange::getTokenRange(decl->getInnerLocStart());
+    llvm::StringRef Token = Lexer::getSourceText(TokenCharRange, *SM, LangOpts);
+    std::string Replacement = ("inline " + Token).str();
+    diag(decl->getInnerLocStart(), "make as 'inline'",
+         DiagnosticIDs::Note)
+         << FixItHint::CreateReplacement(decl->getInnerLocStart(), Replacement);
+    }
+}
+
 void DefinitionsInHeadersCheck::check(const MatchFinder::MatchResult &Result) {
   // Don't run the check in failing TUs.
   if (Result.Context->getDiagnostics().hasUncompilableErrorOccurred())
@@ -86,7 +136,8 @@ void DefinitionsInHeadersCheck::check(const MatchFinder::MatchResult &Result) {
   if (ND->isInvalidDecl())
     return;
 
-  // Internal linkage variable definitions are ignored for now:
+  // Internal linkage variable definitions are ignored if IncludeInternalLinkage
+  // is not set:
   //   const int a = 1;
   //   static int b = 1;
   //
@@ -95,12 +146,16 @@ void DefinitionsInHeadersCheck::check(const MatchFinder::MatchResult &Result) {
   //
   // FIXME: Should declarations in anonymous namespaces get the same treatment
   // as static / const declarations?
-  if (!ND->hasExternalFormalLinkage() && !ND->isInAnonymousNamespace())
+  if (!IncludeInternalLinkage && 
+      !ND->hasExternalFormalLinkage() && !ND->isInAnonymousNamespace())
     return;
+
+  SourceManager *SourceManager = Result.SourceManager;
+  const LangOptions& LangOpts = Result.Context->getLangOpts();
 
   if (const auto *FD = dyn_cast<FunctionDecl>(ND)) {
     // Inline functions are allowed.
-    if (FD->isInlined())
+    if (FD->isInlined() || FD->hasAttr<AlwaysInlineAttr>())
       return;
     // Function templates are allowed.
     if (FD->getTemplatedKind() == FunctionDecl::TK_FunctionTemplate)
@@ -129,9 +184,7 @@ void DefinitionsInHeadersCheck::check(const MatchFinder::MatchResult &Result) {
          "in a header file; function definitions in header files can lead to "
          "ODR violations")
         << IsFullSpec << FD;
-    diag(FD->getLocation(), /*FixDescription=*/"make as 'inline'",
-         DiagnosticIDs::Note)
-        << FixItHint::CreateInsertion(FD->getInnerLocStart(), "inline ");
+    Fix(FD, SourceManager, LangOpts);
   } else if (const auto *VD = dyn_cast<VarDecl>(ND)) {
     // C++14 variable templates are allowed.
     if (VD->getDescribedVarTemplate())
@@ -148,11 +201,15 @@ void DefinitionsInHeadersCheck::check(const MatchFinder::MatchResult &Result) {
     // Ignore inline variables.
     if (VD->isInline())
       return;
+    // Ignore constexpr variables.
+    if(VD->isConstexpr())
+        return;
 
     diag(VD->getLocation(),
          "variable %0 defined in a header file; "
          "variable definitions in header files can lead to ODR violations")
         << VD;
+    Fix(VD, SourceManager, LangOpts);
   }
 }
 

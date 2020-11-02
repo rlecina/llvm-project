@@ -37,6 +37,7 @@ http://clang.llvm.org/docs/HowToSetupToolingForLLVM.html
 from __future__ import print_function
 
 import argparse
+import fnmatch
 import glob
 import json
 import multiprocessing
@@ -48,6 +49,7 @@ import sys
 import tempfile
 import threading
 import traceback
+import yaml
 
 try:
   import yaml
@@ -81,13 +83,15 @@ def make_absolute(f, directory):
 
 def get_tidy_invocation(f, clang_tidy_binary, checks, tmpdir, build_path,
                         header_filter, allow_enabling_alpha_checkers,
-                        extra_arg, extra_arg_before, quiet, config):
+                        extra_arg, extra_arg_before, quiet, config, system_headers):
   """Gets a command line for clang-tidy."""
   start = [clang_tidy_binary, '--use-color']
   if allow_enabling_alpha_checkers:
     start.append('-allow-enabling-analyzer-alpha-checkers')
   if header_filter is not None:
     start.append('-header-filter=' + header_filter)
+  if system_headers is True:
+    start.append('-system-headers')
   if checks:
     start.append('-checks=' + checks)
   if tmpdir is not None:
@@ -165,7 +169,7 @@ def run_tidy(args, tmpdir, build_path, queue, lock, failed_files):
                                      tmpdir, build_path, args.header_filter,
                                      args.allow_enabling_alpha_checkers,
                                      args.extra_arg, args.extra_arg_before,
-                                     args.quiet, args.config)
+                                     args.quiet, args.config, args.system_headers)
 
     proc = subprocess.Popen(invocation, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     output, err = proc.communicate()
@@ -178,6 +182,11 @@ def run_tidy(args, tmpdir, build_path, queue, lock, failed_files):
         sys.stderr.write(err.decode('utf-8'))
     queue.task_done()
 
+def in_excluded_list(filename, excluded):
+  for pattern in excluded:
+     if fnmatch.fnmatch(filename, pattern):
+         return True
+  return False
 
 def main():
   parser = argparse.ArgumentParser(description='Runs clang-tidy over all files '
@@ -209,6 +218,10 @@ def main():
                       'headers to output diagnostics from. Diagnostics from '
                       'the main file of each translation unit are always '
                       'displayed.')
+  parser.add_argument('-system-headers', action='store_true',
+                      help='show diagnostics from system headers.')
+  parser.add_argument('-exclude', default=None,
+                      help='List of files top exclude')
   if yaml:
     parser.add_argument('-export-fixes', metavar='filename', dest='export_fixes',
                         help='Create a yaml file to store suggested fixes in, '
@@ -266,6 +279,8 @@ def main():
   database = json.load(open(os.path.join(build_path, db_path)))
   files = [make_absolute(entry['file'], entry['directory'])
            for entry in database]
+  if args.exclude:
+    excluded = yaml.safe_load(args.exclude)
 
   max_task = args.j
   if max_task == 0:
@@ -295,7 +310,8 @@ def main():
     # Fill the queue with files.
     for name in files:
       if file_name_re.search(name):
-        task_queue.put(name)
+        if not in_excluded_list(name, excluded):
+          task_queue.put(name)
 
     # Wait for all threads to be done.
     task_queue.join()
@@ -319,6 +335,7 @@ def main():
       traceback.print_exc()
       return_code=1
 
+  os.chdir(build_path)
   if args.fix:
     print('Applying fixes ...')
     try:
